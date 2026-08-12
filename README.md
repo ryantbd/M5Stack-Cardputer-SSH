@@ -12,6 +12,17 @@ Debian, Ubuntu, Fedora, and Arch, Windows OpenSSH Server, macOS Remote Login,
 NAS devices, OpenWrt routers, virtual machines, and cloud servers. The target
 only needs to be reachable on the network and have SSH enabled.
 
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/terminal.jpg" alt="M5Stack Cardputer ADV running an SSH terminal"></td>
+    <td width="50%"><img src="docs/images/settings.jpg" alt="M5Stack Cardputer ADV SSH settings menu"></td>
+  </tr>
+  <tr>
+    <td align="center">SSH terminal</td>
+    <td align="center">On-device settings</td>
+  </tr>
+</table>
+
 > This is a community project for M5Stack hardware and is not affiliated with
 > or endorsed by M5Stack.
 

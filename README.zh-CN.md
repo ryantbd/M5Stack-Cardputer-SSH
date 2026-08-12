@@ -10,6 +10,17 @@
 OpenSSH Server、macOS Remote Login、NAS、OpenWrt 路由器、虚拟机和云服务器。树莓派和
 Ubuntu 都只是可连接的设备或系统示例，并非程序限制。
 
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/terminal.jpg" alt="M5Stack Cardputer ADV 正在运行 SSH 终端"></td>
+    <td width="50%"><img src="docs/images/settings.jpg" alt="M5Stack Cardputer ADV 的 SSH 设置菜单"></td>
+  </tr>
+  <tr>
+    <td align="center">SSH 终端</td>
+    <td align="center">设备端设置</td>
+  </tr>
+</table>
+
 > 这是面向 M5Stack 硬件的社区项目，与 M5Stack 官方不存在隶属或背书关系。
 
 ## 主要功能
