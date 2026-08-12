@@ -1,0 +1,25 @@
+name: PlatformIO build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+      - name: Reject tracked secrets and private keys
+        run: |
+          if git ls-files | grep -E '(^|/)(secrets\.h|id_rsa|id_ed25519|.*\.(pem|key)|\.env(\..*)?)$'; then exit 1; fi
+          if git ls-files | grep -E '(^|/)(docs/superpowers|\.pio|\.worktrees|\.publish|\.vscode)(/|$)'; then exit 1; fi
+          if git grep -I -n -E 'BEGIN (OPENSSH|RSA|EC|DSA) PRIVATE KEY'; then exit 1; fi
+      - name: Run native tests
+        run: pio test -e native
+      - name: Build firmware
+        run: pio run
