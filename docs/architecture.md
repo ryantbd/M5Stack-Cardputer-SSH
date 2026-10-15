@@ -6,14 +6,16 @@ M5Cardputer ADV                         SSH server
 | semantic keyboard + LCD   |  Wi-Fi  | OpenSSH server        |
 | profiles + NVS + history  |---------| PTY + remote shell    |
 | LibSSH-ESP32 client       |  SSH    | No companion service  |
+| WireGuard (optional)      |  (VPN)  |                       |
 +---------------------------+          +-----------------------+
 ```
 
 ## Components
 
 - `AppController` owns setup, recovery, profile management, the host launcher,
-  and the REMOTE/LOCAL terminal flow. Wi-Fi startup stops at the launcher and
-  SSH begins only after the user selects a host.
+  the REMOTE/LOCAL terminal flow, and the USB serial setup commands (`keys`,
+  `wifi-add`, `host-add`, `vpn-import`). Wi-Fi startup stops at the launcher
+  and SSH begins only after the user selects a host.
 - `KeyboardRouter` is the only normal runtime component that interprets the
   M5Cardputer keyboard matrix. It emits bounded semantic events, applies chord
   precedence, key repeat, and release gating across page transitions.
@@ -31,9 +33,17 @@ M5Cardputer ADV                         SSH server
   and network recovery transitions explicit.
 - `Diagnostics` formats numeric runtime state without credentials or profile
   blobs.
-- `SshClient` separates fingerprint retrieval from password authentication,
+- `SshClient` separates fingerprint retrieval from authentication, asks the
+  server which methods it offers, tries the device key before a password,
   requests a fixed 40×13 `xterm-256color` PTY, and uses typed non-blocking
-  channel reads.
+  channel reads. It also generates and describes the device's Ed25519 key.
+- `DeviceIdentity` holds the device's OpenSSH-format Ed25519 private key in a
+  CRC-protected `identity` blob. Only the public half is ever shown or printed.
+- `VpnConfig` stores the single WireGuard peer in a CRC-protected `vpn` blob
+  and parses wg-quick text; a missing `PrivateKey` keeps the device's own key.
+- `WireGuardTunnel` drives WireGuard-ESP32's `wireguardif` from lwIP's thread.
+  The interface netmask comes from `AllowedIPs`, so only that subnet is routed
+  through it (unless it is `0.0.0.0/0`), and it sets a persistent keepalive.
 - `UiRenderer` draws every screen through one 8-bit 240 x 135 sprite.
 - `TerminalEmulator` incrementally decodes bounded UTF-8 and xterm control
   sequences into fixed primary and alternate `TerminalScreen` instances. It
@@ -72,15 +82,21 @@ SHA-256 host-key fingerprint, obtains explicit trust, and tests SSH login. Only
 then does `ProfileStore` verify the complete write by reading it back and
 validating its CRC.
 
-The initial connection is TOFU. Later connections compare the raw 32-byte hash
-in constant time before password authentication. A mismatch is a hard stop and
-the password-authentication function is not called. Settings edits use a
+The initial connection is TOFU, unless `host-add` pinned the key over USB.
+Later connections compare the raw 32-byte hash in constant time before any
+authentication. A mismatch is a hard stop and no credentials are sent. Settings edits use a
 temporary copy; failed validation or NVS writes leave the persisted config
 unchanged.
 
-Credentials are stored in ordinary ESP32 NVS, not a secure element. Physical
-flash extraction remains a threat, so a dedicated unprivileged remote account
-without passwordless sudo is recommended.
+Credentials are stored in ordinary ESP32 NVS, not a secure element. That
+includes the device's SSH and WireGuard private keys, which are generated on
+the device and never exported. Physical flash extraction remains a threat, so a
+dedicated unprivileged remote account without passwordless sudo is recommended,
+and a lost device's public keys should be removed from its servers.
+
+The WireGuard tunnel starts only once NTP has set the clock: handshakes carry a
+TAI64N timestamp, and a peer rejects one older than the last it accepted, so an
+unset clock would fail every handshake after the first.
 
 ### Profile configuration migration boundary
 
@@ -91,8 +107,8 @@ complete read-back and CRC check. Migration never overwrites or removes the
 legacy key, so a failed migration leaves the previous firmware usable.
 
 The generic host launcher now uses V2 directly. Ordinary firmware uploads do
-not erase NVS; only the explicit Clear All action removes both configuration
-keys.
+not erase NVS; only the explicit Clear All action removes the configuration
+keys, together with the `identity` and `vpn` blobs.
 
 ## Bounds and verified build
 
@@ -101,11 +117,14 @@ keys.
 - Keyboard snapshot: 56 bits; semantic queue: 8 events; per-key repeat state.
 - Terminal: 40 columns, 13 visible rows, 120 completed scrollback lines.
 - Framebuffer: one 8-bit 240 x 135 sprite (about 32.4 KB).
-- Strict ADV build: 95,740 bytes RAM (29.2%) and 1,174,009 bytes Flash (35.1%).
+- VPN: one IPv4 peer; wg-quick text up to 2,048 bytes; NTP wait 15 seconds;
+  on-screen USB import times out after 120 seconds.
+- Strict ADV build: 97,644 bytes RAM (29.8%) and 1,347,589 bytes Flash (40.3%).
 
 All project C++ sources compile with `-Wall -Wextra -Werror`. The native CI
 suite covers configuration/migration, scanning/selection, physical keyboard
-routing, session flow, diagnostics, terminal encoding, and scroll arithmetic.
+routing, session flow, diagnostics, terminal encoding, scroll arithmetic, wg-quick
+parsing, and the identity and VPN stores.
 Third-party LibSSH-ESP32 C sources
 currently emit upstream const/deprecation warnings outside the project-source
 warning policy.
@@ -115,5 +134,6 @@ warning policy.
 The terminal implements a bounded VT100/xterm subset for Bash, Vim, nano, top,
 htop, and tmux. It intentionally omits CJK/double-width layout, combining and
 bidirectional text, mouse protocols, terminal graphics, OSC clipboard, and
-live PTY resize. SSH password authentication is supported; SSH public-key
-authentication remains future work.
+live PTY resize. SSH login uses a password or the device's own Ed25519 key;
+importing other private keys and SSH agents are not supported. The VPN supports
+one IPv4 WireGuard peer.

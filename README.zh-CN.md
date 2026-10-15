@@ -29,7 +29,9 @@ Ubuntu 都只是可连接的设备或系统示例，并非程序限制。
 - 扫描 2.4 GHz Wi-Fi 的 1–13 信道，并支持手动添加隐藏网络
 - 通过 `_ssh._tcp` mDNS 发现通用 SSH 服务，也可手动填写主机名、IP 和端口
 - 认证前显示并验证服务器的 SHA-256 主机密钥指纹
-- 每个主机可以保存密码，或者在每次连接时重新输入
+- 使用设备自己生成、永不导出的 Ed25519 密钥登录，或使用保存的/每次输入的密码
+- 通过 WireGuard VPN 访问内网主机；只有对端 AllowedIPs 范围内的流量走隧道
+- 可选：从电脑通过 USB 配置 Wi-Fi、主机和 VPN
 - 开机只进入主机列表，不会自动连接某个 SSH 主机
 - 提供绿色 REMOTE 终端和橙色 LOCAL 只读回滚模式
 - 支持 Cardputer 的 Aa、Fn、Ctrl、Alt、Opt、方向键、F1–F12、Tab、Escape、
@@ -81,13 +83,104 @@ python -m esptool --chip esp32s3 --port COM4 --baud 460800 write-flash 0x10000 M
 
 首次启动时，在 Cardputer 上添加一个 2.4 GHz Wi-Fi。连接成功后会进入 `SSH HOSTS`。
 你可以发现 `_ssh._tcp` 服务，也可以手动添加任意服务器的名称、主机名/IP、端口和用户名。
+设备首次启动时还会生成自己的 SSH 密钥和 WireGuard 密钥，详见
+[设备密钥与 WireGuard VPN](#设备密钥与-wireguard-vpn)。
 
 首次连接会显示服务器的 SHA-256 主机密钥指纹。请先和服务器上的指纹核对，再选择信任。
-只有确认信任后，固件才会读取或发送密码。以后如果主机密钥变化，连接会直接停止，直到你
+只有确认信任后，固件才会使用任何凭据。以后如果主机密钥变化，连接会直接停止，直到你
 确认服务器确实更换或重装，并在 Settings 中手动重置信任。
 
 Settings 可以添加、编辑、启用、禁用、删除、调整优先级或重新排列 Wi-Fi 与主机配置。
 每个主机可以把密码保存在 ESP32 NVS 中，也可以设置为每次连接时询问。
+
+## 设备密钥与 WireGuard VPN
+
+### 设备密钥
+
+首次启动时，Cardputer 会生成一个 Ed25519 密钥并保存在 NVS 中，只有公钥会离开设备。
+要用它登录，请把公钥加入服务器的 `~/.ssh/authorized_keys`。**Settings > Device key**
+可以在屏幕上显示公钥，或通过 USB 串口输出。
+
+连接时会先尝试设备密钥。只有服务器拒绝该密钥、且同时允许密码登录时，才会使用保存的
+或当场输入的密码。因此只接受密钥的服务器可以直接使用，原有的密码主机也不受影响。
+添加只接受密钥的主机时，请选择 **Device key, else prompt**。
+
+在服务器上可以把该密钥限制为只允许来自设备的 VPN 地址，例如
+`from="10.0.0.2" ssh-ed25519 AAAA... cardputer-1a2b3c`。在 Settings 中重新生成密钥会
+替换旧密钥，需要把新公钥重新加到服务器上。
+
+### WireGuard VPN
+
+客户端可以在任意 2.4 GHz Wi-Fi 下，通过 WireGuard 访问内网主机（例如 VPN 中心节点后面的服务器）。
+
+1. 在 **Settings > WireGuard VPN** 中查看设备的 WireGuard 公钥，或通过 USB 发送 `keys`
+   （见下文）。该密钥在首次启动时生成。
+2. 在 WireGuard 服务器上把 Cardputer 添加为对端，并分配一个地址：
+
+   ```ini
+   [Peer]
+   # cardputer
+   PublicKey = <Cardputer 公钥>
+   AllowedIPs = 10.0.0.2/32
+   ```
+
+3. 给 Cardputer 一份标准的 wg-quick 配置。`PrivateKey` 行可以省略，省略时设备继续使用
+   自己生成的密钥。
+
+   ```ini
+   [Interface]
+   Address = 10.0.0.2/32
+
+   [Peer]
+   PublicKey = <服务器公钥>
+   Endpoint = vpn.example.com:51820
+   AllowedIPs = 10.0.0.0/24
+   PersistentKeepalive = 25
+   ```
+
+   可以通过 **Settings > WireGuard VPN > Import config over USB** 发送，也可以使用下文的
+   `vpn-import`。导入后 VPN 会自动开启。
+
+Wi-Fi 连接后，设备会先通过 NTP 校准时钟（WireGuard 握手包含服务器会检查的时间戳），
+然后启动隧道；运行后主机列表会显示 `WIFI+VPN`。只有 `AllowedIPs` 范围内的流量走隧道
+（`0.0.0.0/0` 表示全部流量），DNS、NTP 和 mDNS 仍直接使用 Wi-Fi。添加 VPN 内的主机时
+请使用其隧道地址。
+
+只支持一个对端和 IPv4：`Address` 和 `AllowedIPs` 只使用第一个 IPv4 条目，`Address`
+必须位于 `AllowedIPs` 范围内；`DNS`、`MTU`、IPv6 条目和 IPv6 Endpoint 会被忽略或拒绝。
+
+### 通过 USB 配置（可选）
+
+除了在 Cardputer 上输入，也可以从电脑通过 USB 串口发送配置。
+[`tools/cardputer_serial.py`](tools/cardputer_serial.py)（需要 `pip install pyserial`）
+打开串口时不会重启设备，并且只打印设备的回复：
+
+```bash
+python3 tools/cardputer_serial.py keys                 # SSH 和 WireGuard 公钥
+python3 tools/cardputer_serial.py vpn-import wg0.conf  # 上文格式的 wg-quick 配置
+python3 tools/cardputer_serial.py host-add host.txt
+printf 'ssid=%s\npassword=%s\n' "$SSID" "$PASSWORD" | python3 tools/cardputer_serial.py wifi-add -
+```
+
+主机文件由 `key=value` 行组成（`port` 默认为 22）：
+
+```text
+name=homelab
+host=10.0.0.10
+port=22
+user=me
+hostkey=SHA256:...
+```
+
+`hostkey` 可以省略。填写后，服务器的 Ed25519 主机密钥会在首次连接前就被固定，而不是
+首次连接时才信任。请从可信来源获取指纹，例如在服务器上运行
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`，或对自己的 `known_hosts` 运行
+`ssh-keygen -lF <host>`。
+
+每条命令会回复 `<命令>: ok` 或 `<命令>: error: <原因>`；如果当前没有 SSH 会话，设备随后
+会重启以应用更改。`wifi-add` 和 `host-add` 会替换 SSID 或名称相同的已有配置。不用脚本时，
+先单独发送命令一行，再发送内容各行，最后发送 `END`。内容不会被回显或记录，但与键盘一样，
+任何能接触 USB 端口的人都可以发送命令。
 
 ## 键盘
 
@@ -163,9 +256,11 @@ PS1='\u@\h:\w\n\$ '
 ## 安全与限制
 
 - 建议创建没有免密 `sudo` 权限的专用普通远程账户。
-- 保存的凭据位于普通 ESP32 NVS，而不是安全芯片；能够物理读取 Flash 的人可能提取凭据。
+- 保存的密码以及设备的 SSH、WireGuard 私钥都位于普通 ESP32 NVS，而不是安全芯片；
+  能够物理读取 Flash 的人可能提取它们。设备丢失时，请从服务器的 `authorized_keys`
+  中删除其公钥，并从 WireGuard 服务器上删除其对端。
 - 遇到主机密钥变化时，应先确认服务器情况，再重置信任。
-- 当前版本支持 SSH 用户名和密码认证，暂不支持 SSH 私钥或公钥认证。
+- SSH 登录使用设备自己的 Ed25519 密钥或密码；不支持导入其他私钥或使用 SSH agent。
 - 终端暂不支持 CJK/双宽排版、组合字符、双向文字、鼠标协议、终端图形、OSC 剪贴板和
   实时 PTY 尺寸调整。
 
