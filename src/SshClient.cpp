@@ -82,7 +82,106 @@ bool SshClient::authenticatePassword(const char* password, String& error) {
         disconnect();
         return false;
     }
+    return openShell(error);
+}
 
+int SshClient::authMethods(String& error) {
+    error = "";
+    if (!sessionConnected() || !hostKeyVerified()) {
+        error = "SSH session or host trust invalid";
+        return 0;
+    }
+    // The server only lists its methods in reply to a "none" attempt.
+    if (ssh_userauth_none(session_, nullptr) == SSH_AUTH_ERROR) {
+        error = sshError(session_, "SSH authentication failed");
+        return 0;
+    }
+    return ssh_userauth_list(session_, nullptr);
+}
+
+bool SshClient::authenticatePublicKey(const char* privateKey, bool& rejected, String& error) {
+    error = "";
+    rejected = false;
+    if (!sessionConnected() || !hostKeyVerified() || privateKey == nullptr || privateKey[0] == '\0') {
+        error = "SSH session, host trust, or device key invalid";
+        return false;
+    }
+
+    ssh_key key = nullptr;
+    if (ssh_pki_import_privkey_base64(privateKey, nullptr, nullptr, nullptr, &key) != SSH_OK) {
+        error = "Device key is unreadable";
+        return false;
+    }
+    const int authResult = ssh_userauth_publickey(session_, nullptr, key);
+    ssh_key_free(key);
+    if (authResult != SSH_AUTH_SUCCESS) {
+        rejected = authResult == SSH_AUTH_DENIED || authResult == SSH_AUTH_PARTIAL;
+        error = sshError(session_, "Device key rejected");
+        if (!rejected) disconnect();
+        return false;
+    }
+    return openShell(error);
+}
+
+bool SshClient::generateEd25519Key(char* privateKey, size_t capacity, String& error) {
+    error = "";
+    libssh_begin();
+    ssh_key key = nullptr;
+    if (ssh_pki_generate(SSH_KEYTYPE_ED25519, 0, &key) != SSH_OK) {
+        error = "Cannot generate key";
+        return false;
+    }
+    char* exported = nullptr;
+    const int exportResult = ssh_pki_export_privkey_base64(key, nullptr, nullptr, nullptr, &exported);
+    ssh_key_free(key);
+    if (exportResult != SSH_OK || exported == nullptr) {
+        error = "Cannot export key";
+        return false;
+    }
+    const size_t length = strlen(exported);
+    const bool copied = app::copyConfigString(privateKey, capacity, exported);
+    app::secureClear(exported, length);
+    ssh_string_free_char(exported);
+    if (!copied) error = "Key too large";
+    return copied;
+}
+
+bool SshClient::describePublicKey(const char* privateKey, const char* comment,
+                                  String& publicKeyLine, String& fingerprint) {
+    publicKeyLine = "";
+    fingerprint = "";
+    libssh_begin();
+    ssh_key key = nullptr;
+    ssh_key publicKey = nullptr;
+    if (ssh_pki_import_privkey_base64(privateKey, nullptr, nullptr, nullptr, &key) != SSH_OK) {
+        return false;
+    }
+    const bool derived = ssh_pki_export_privkey_to_pubkey(key, &publicKey) == SSH_OK;
+    ssh_key_free(key);
+    if (!derived) return false;
+
+    char* encoded = nullptr;
+    unsigned char* hash = nullptr;
+    size_t hashLength = 0;
+    bool described = false;
+    if (ssh_pki_export_pubkey_base64(publicKey, &encoded) == SSH_OK &&
+        ssh_get_publickey_hash(publicKey, SSH_PUBLICKEY_HASH_SHA256, &hash, &hashLength) == SSH_OK) {
+        char* printable = ssh_get_fingerprint_hash(SSH_PUBLICKEY_HASH_SHA256, hash, hashLength);
+        if (printable != nullptr) {
+            publicKeyLine = String(ssh_key_type_to_char(ssh_key_type(publicKey))) + " " + encoded;
+            if (comment != nullptr && comment[0] != '\0') publicKeyLine += String(" ") + comment;
+            fingerprint = printable;
+            ssh_string_free_char(printable);
+            described = true;
+        }
+    }
+    if (hash != nullptr) ssh_clean_pubkey_hash(&hash);
+    if (encoded != nullptr) ssh_string_free_char(encoded);
+    ssh_key_free(publicKey);
+    return described;
+}
+
+bool SshClient::openShell(String& error) {
     channel_ = ssh_channel_new(session_);
     if (channel_ == nullptr) {
         error = "Cannot allocate SSH channel";

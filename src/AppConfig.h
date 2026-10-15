@@ -109,5 +109,6 @@ bool migrateConfigV1(const LegacyConfigV1& legacy, ProfileConfigData& destinatio
 bool copyConfigString(char* destination, size_t capacity, const char* source);
 bool isConfigStringTerminated(const char* value, size_t capacity);
 void secureClear(void* data, size_t length);
+uint32_t calculateCrc32(const void* data, size_t length);
 
 }  // namespace app

@@ -4,6 +4,7 @@
 #include <M5Cardputer.h>
 
 #include "AppConfig.h"
+#include "DeviceIdentity.h"
 #include "Diagnostics.h"
 #include "HostCatalog.h"
 #include "HostDraftTransaction.h"
@@ -19,7 +20,9 @@
 #include "TerminalViewport.h"
 #include "TextEditModel.h"
 #include "UiRenderer.h"
+#include "VpnConfig.h"
 #include "WifiManager.h"
+#include "WireGuardTunnel.h"
 
 namespace app {
 
@@ -32,6 +35,7 @@ private:
     enum class SshAttemptResult : uint8_t { Success, Canceled, HostKeyMismatch, Failed };
     enum class HostEditOutcome : uint8_t { Stay, ReturnToLauncher, Connected };
     enum class DraftAttemptResult : uint8_t { Authenticated, Canceled, HostKeyMismatch, Failed };
+    enum class AuthResult : uint8_t { Authenticated, Canceled, Failed };
 
     static bool operationCanceledThunk(void* context);
     static void operationProgressThunk(const char* stage, uint16_t current, uint16_t total, void* context);
@@ -69,6 +73,22 @@ private:
     HostEditOutcome hostManagerMenu();
     HostEditOutcome discoverHost();
     SshAttemptResult connectHostProfile(uint8_t index, String& error);
+    AuthResult authenticateHost(const SshHostProfile& host, String& error);
+    void loadIdentity();
+    bool saveIdentity(const DeviceIdentityData& identity);
+    bool generateDeviceKey();
+    String deviceKeyComment() const;
+    void deviceKeyMenu();
+    void loadVpnConfig();
+    bool saveVpnConfig(const VpnConfigData& vpn);
+    bool ensureVpnKey();
+    void ensureVpn();
+    String vpnStatusText();
+    void vpnMenu();
+    void importVpnOverUsb();
+    void showTextBlock(const String& title, const String& header, const String& value);
+    void serviceSerialCommands();
+    void printPublicKeys();
     void settingsMenu();
     void diagnosticsPage();
 
@@ -94,6 +114,13 @@ private:
     TerminalUiModel terminalUi_;
     KeyboardRouter keyboard_;
     ProfileConfigData config_{};
+    DeviceIdentityData identity_{};
+    VpnConfigData vpn_{};
+    WireGuardTunnel tunnel_;
+    String vpnError_;
+    bool vpnAttempted_ = false;
+    bool serialImportActive_ = false;
+    String serialLine_;
     SessionFlow flow_;
     WifiScanSummary lastScanSummary_{};
 

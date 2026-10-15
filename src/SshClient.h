@@ -15,7 +15,19 @@ public:
     SshClient& operator=(const SshClient&) = delete;
 
     bool start(const char* host, uint16_t port, const char* user, String& error);
+    // Methods the server offers (SSH_AUTH_METHOD_* bits); 0 on error. Call
+    // after the host key is verified.
+    int authMethods(String& error);
     bool authenticatePassword(const char* password, String& error);
+    // On a rejected key the session stays open (and `rejected` is set) so the
+    // caller can fall back to a password.
+    bool authenticatePublicKey(const char* privateKey, bool& rejected, String& error);
+
+    // OpenSSH-format private key text for a new Ed25519 key.
+    static bool generateEd25519Key(char* privateKey, size_t capacity, String& error);
+    // "ssh-ed25519 AAAA... comment" and its SHA256 fingerprint.
+    static bool describePublicKey(const char* privateKey, const char* comment,
+                                  String& publicKeyLine, String& fingerprint);
 
     bool verifyServerKey(const uint8_t* expectedHash, size_t length);
     void trustCurrentServerKey();
@@ -34,6 +46,7 @@ public:
 
 private:
     bool readServerFingerprint(String& error);
+    bool openShell(String& error);
 
     ssh_session session_ = nullptr;
     ssh_channel channel_ = nullptr;

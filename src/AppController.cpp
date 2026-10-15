@@ -17,6 +17,11 @@ constexpr uint16_t kError = 0xF800;
 constexpr uint32_t kWifiTimeoutMs = 15000;
 constexpr uint32_t kFrameIntervalMs = 50;
 constexpr uint32_t kCursorBlinkIntervalMs = 500;
+constexpr uint32_t kClockSyncTimeoutMs = 15000;
+constexpr uint32_t kVpnImportTimeoutMs = 120000;
+constexpr size_t kVpnImportLineLimit = 200;
+constexpr char kIdentityStorageKey[] = "identity";
+constexpr char kVpnStorageKey[] = "vpn";
 
 bool recoveryCombo() {
     bool fn = false;
@@ -59,16 +64,28 @@ void AppController::begin() {
     ui_.progress("Cardputer SSH", "Starting", 0, 0, true);
     if (bootRecoveryRequested()) recoveryMenu();
     while (!loadConfiguration()) delay(10);
+    loadIdentity();
+    loadVpnConfig();
+    // Create both device keys up front so their public halves can be read
+    // over USB (send "keys") before any on-device setup.
+    if (!identityHasSshKey(identity_)) generateDeviceKey();
+    ensureVpnKey();
+    printPublicKeys();
     flow_.apply(SessionEvent::ConfigReady);
     const int directWifiIndex = ensureWifiConfigured();
     wifiConnectionFlow(directWifiIndex);
+    ensureVpn();
     hostLauncher();
     renderTerminal(true);
 }
 
 void AppController::loop() {
     if (!flow_.sessionLive()) {
-        if (WiFi.status() != WL_CONNECTED) wifiConnectionFlow();
+        if (WiFi.status() != WL_CONNECTED) {
+            wifiConnectionFlow();
+            vpnAttempted_ = false;  // A new network may let a failed VPN start.
+        }
+        ensureVpn();
         hostLauncher();
         renderTerminal(true);
         return;
@@ -119,6 +136,7 @@ void AppController::operationProgress(const char* stage, uint16_t current, uint1
 }
 
 bool AppController::pollEvent(InputContext context, KeyEvent& eventValue) {
+    serviceSerialCommands();
     keyboard_.pollHardware(context, millis());
     return keyboard_.pop(eventValue);
 }
@@ -223,8 +241,9 @@ bool AppController::bootRecoveryRequested() {
 void AppController::recoveryMenu() {
     const String labels[] = {"Continue boot", "Clear all configuration", "Restart"};
     const int action = selectMenu("Recovery", labels, nullptr, 3, 0);
-    if (action == 1 && confirm("Clear everything?", "Removes Wi-Fi and hosts", "Clear")) {
-        if (profileStore_.clearAll()) ESP.restart();
+    if (action == 1 && confirm("Clear everything?", "Wi-Fi, hosts, keys and VPN", "Clear")) {
+        if (profileStore_.clearAll() && configStorage_.remove(kIdentityStorageKey) &&
+            configStorage_.remove(kVpnStorageKey)) ESP.restart();
         waitMessage("Clear failed", "NVS was not changed", "Try restarting", kError);
     } else if (action == 2) ESP.restart();
 }
@@ -497,7 +516,8 @@ void AppController::hostLauncher() {
         labels[enabled + 1] = "Add host...";
         labels[enabled + 2] = "Settings";
         const int selected = selectMenu("SSH HOSTS", labels, details, enabled + 3, 0,
-                                        String(enabled) + "/" + config_.hostCount + "  WIFI READY");
+                                        String(enabled) + "/" + config_.hostCount +
+                                            (tunnel_.running() ? "  WIFI+VPN" : "  WIFI READY"));
         if (selected < 0 || selected == static_cast<int>(enabled + 2)) {
             settingsMenu();
             if (flow_.sessionLive()) return;
@@ -636,7 +656,7 @@ bool AppController::editHostDraftFields(SshHostProfile& host) {
         waitMessage("Invalid port", "Use 1-65535", "Nothing saved", kError);
         return false;
     }
-    const String passwordChoices[] = {"Prompt each connection", "Save password"};
+    const String passwordChoices[] = {"Device key, else prompt", "Save password"};
     const int passwordMode = selectMenu("SSH password", passwordChoices, nullptr, 2, host.savePassword ? 1 : 0);
     if (passwordMode < 0) return false;
     String password = passwordMode == 1 ? String(host.password) : String();
@@ -718,29 +738,11 @@ AppController::DraftAttemptResult AppController::connectHostDraft(SshHostProfile
     }
     flow_.apply(SessionEvent::HostVerified);
 
-    char password[kSshPasswordCapacity]{};
-    if (host.savePassword != 0) {
-        copyConfigString(password, sizeof(password), host.password);
-    } else {
-        String entered;
-        if (!inputText(host.displayName, "SSH password", entered, kSshPasswordCapacity - 1, true, false)) {
-            clearSensitiveString(entered);
-            secureClear(password, sizeof(password));
-            ssh_.disconnect();
-            flow_.apply(SessionEvent::RemoteClosed);
-            return DraftAttemptResult::Canceled;
-        }
-        copyConfigString(password, sizeof(password), entered.c_str());
-        clearSensitiveString(entered);
-    }
-
-    ui_.progress("Authenticating SSH", host.displayName, 0, 0, true);
-    const bool authenticated = ssh_.authenticatePassword(password, error);
-    secureClear(password, sizeof(password));
-    if (!authenticated) {
+    const AuthResult auth = authenticateHost(host, error);
+    if (auth != AuthResult::Authenticated) {
         ssh_.disconnect();
         flow_.apply(SessionEvent::RemoteClosed);
-        return DraftAttemptResult::Failed;
+        return auth == AuthResult::Canceled ? DraftAttemptResult::Canceled : DraftAttemptResult::Failed;
     }
     return DraftAttemptResult::Authenticated;
 }
@@ -878,23 +880,10 @@ AppController::SshAttemptResult AppController::connectHostProfile(uint8_t index,
     }
     flow_.apply(SessionEvent::HostVerified);
 
-    char password[kSshPasswordCapacity]{};
-    if (host.savePassword != 0) {
-        copyConfigString(password, sizeof(password), host.password);
-    } else {
-        String entered;
-        if (!inputText(host.displayName, "SSH password", entered, kSshPasswordCapacity - 1, true, false)) {
-            clearSensitiveString(entered); secureClear(password, sizeof(password)); ssh_.disconnect();
-            flow_.apply(SessionEvent::RemoteClosed); return SshAttemptResult::Canceled;
-        }
-        copyConfigString(password, sizeof(password), entered.c_str());
-        clearSensitiveString(entered);
-    }
-    ui_.progress("Authenticating SSH", host.displayName, 0, 0, true);
-    const bool authenticated = ssh_.authenticatePassword(password, error);
-    secureClear(password, sizeof(password));
-    if (!authenticated) {
-        ssh_.disconnect(); flow_.apply(SessionEvent::RemoteClosed); return SshAttemptResult::Failed;
+    const AuthResult auth = authenticateHost(host, error);
+    if (auth != AuthResult::Authenticated) {
+        ssh_.disconnect(); flow_.apply(SessionEvent::RemoteClosed);
+        return auth == AuthResult::Canceled ? SshAttemptResult::Canceled : SshAttemptResult::Failed;
     }
     flow_.apply(SessionEvent::Authenticated);
     activeHostIndex_ = index;
@@ -907,16 +896,19 @@ void AppController::settingsMenu() {
     const uint32_t generation = configGeneration_;
     flow_.apply(SessionEvent::OpenSettings);
     while (true) {
-        const String labels[] = {"Manage Wi-Fi", "Manage SSH hosts", "Diagnostics", "About", "Back"};
-        const int action = selectMenu("Settings", labels, nullptr, 5, 0);
-        if (action < 0 || action == 4) break;
+        const String labels[] = {"Manage Wi-Fi", "Manage SSH hosts", "Device key", "WireGuard VPN",
+                                 "Diagnostics", "About", "Back"};
+        const int action = selectMenu("Settings", labels, nullptr, 7, 0);
+        if (action < 0 || action == 6) break;
         if (action == 0) wifiManagerMenu();
         else if (action == 1) {
             const HostEditOutcome outcome = hostManagerMenu();
             if (outcome != HostEditOutcome::Stay) return;
         }
-        else if (action == 2) diagnosticsPage();
-        else if (action == 3)
+        else if (action == 2) deviceKeyMenu();
+        else if (action == 3) vpnMenu();
+        else if (action == 4) diagnosticsPage();
+        else if (action == 5)
             waitMessage("Cardputer SSH", "Generic SSH client", "4 Wi-Fi / 8 hosts", kAccent);
     }
     if (wasLive && generation != configGeneration_) {
@@ -1149,6 +1141,342 @@ void AppController::closeTerminalSession(SessionEvent reason) {
     flow_.apply(reason);
     activeHostIndex_ = -1;
     resetTerminalSessionState(false);
+}
+
+AppController::AuthResult AppController::authenticateHost(const SshHostProfile& host, String& error) {
+    ui_.progress("Authenticating SSH", host.displayName, 0, 0, true);
+    const int methods = ssh_.authMethods(error);
+    if (methods == 0) return AuthResult::Failed;
+    const bool hasKey = identityHasSshKey(identity_);
+    const bool keyOffered = (methods & SSH_AUTH_METHOD_PUBLICKEY) != 0;
+    const bool passwordOffered = (methods & SSH_AUTH_METHOD_PASSWORD) != 0;
+
+    if (hasKey && keyOffered) {
+        ui_.progress("Authenticating SSH", "Device key", 0, 0, true);
+        bool rejected = false;
+        if (ssh_.authenticatePublicKey(identity_.sshPrivateKey, rejected, error)) return AuthResult::Authenticated;
+        if (!rejected) return AuthResult::Failed;
+        if (!passwordOffered) {
+            error = "Device key not authorized";
+            return AuthResult::Failed;
+        }
+    } else if (!passwordOffered) {
+        error = hasKey ? "Server offers no key/password login" : "Needs a key: Settings > Device key";
+        return AuthResult::Failed;
+    }
+
+    char password[kSshPasswordCapacity]{};
+    if (host.savePassword != 0) {
+        copyConfigString(password, sizeof(password), host.password);
+    } else {
+        String entered;
+        if (!inputText(host.displayName, "SSH password", entered, kSshPasswordCapacity - 1, true, false)) {
+            clearSensitiveString(entered);
+            return AuthResult::Canceled;
+        }
+        copyConfigString(password, sizeof(password), entered.c_str());
+        clearSensitiveString(entered);
+    }
+    ui_.progress("Authenticating SSH", host.displayName, 0, 0, true);
+    const bool authenticated = ssh_.authenticatePassword(password, error);
+    secureClear(password, sizeof(password));
+    return authenticated ? AuthResult::Authenticated : AuthResult::Failed;
+}
+
+void AppController::loadIdentity() {
+    size_t length = 0;
+    DeviceIdentityData stored{};
+    if (configStorage_.length(kIdentityStorageKey, length) == BlobStatus::Ok && length == sizeof(stored) &&
+        configStorage_.read(kIdentityStorageKey, &stored, sizeof(stored)) && validateIdentity(stored)) {
+        identity_ = stored;
+    } else {
+        resetIdentity(identity_);
+    }
+    secureClear(&stored, sizeof(stored));
+}
+
+bool AppController::saveIdentity(const DeviceIdentityData& identity) {
+    DeviceIdentityData readBack{};
+    const bool saved = configStorage_.write(kIdentityStorageKey, &identity, sizeof(identity)) &&
+                       configStorage_.read(kIdentityStorageKey, &readBack, sizeof(readBack)) &&
+                       memcmp(&readBack, &identity, sizeof(identity)) == 0;
+    secureClear(&readBack, sizeof(readBack));
+    return saved;
+}
+
+bool AppController::generateDeviceKey() {
+    ui_.progress("Device key", "Generating Ed25519 key", 0, 0, true);
+    DeviceIdentityData updated = identity_;
+    String error;
+    if (!SshClient::generateEd25519Key(updated.sshPrivateKey, sizeof(updated.sshPrivateKey), error)) {
+        secureClear(&updated, sizeof(updated));
+        Serial.println(String("device-key: error: ") + error);
+        waitMessage("Key generation failed", error, "Nothing changed", kError);
+        return false;
+    }
+    finalizeIdentity(updated);
+    const bool saved = validateIdentity(updated) && saveIdentity(updated);
+    if (saved) identity_ = updated;
+    secureClear(&updated, sizeof(updated));
+    if (!saved) waitMessage("Save failed", "Old key kept", "", kError);
+    return saved;
+}
+
+String AppController::deviceKeyComment() const {
+    String mac = WiFi.macAddress();
+    mac.replace(":", "");
+    mac.toLowerCase();
+    return String("cardputer-") + mac.substring(6);
+}
+
+void AppController::deviceKeyMenu() {
+    if (!identityHasSshKey(identity_) && !generateDeviceKey()) return;
+    while (true) {
+        String publicKeyLine;
+        String fingerprint;
+        if (!SshClient::describePublicKey(identity_.sshPrivateKey, deviceKeyComment().c_str(),
+                                          publicKeyLine, fingerprint)) {
+            waitMessage("Device key unreadable", "Generate a new one", "", kError);
+        }
+        const String labels[] = {"Show public key", "Print to USB serial", "Generate new key", "Back"};
+        const String details[] = {clipped(fingerprint, 38), "For authorized_keys", "Servers must add it again", ""};
+        const int action = selectMenu("Device key", labels, details, 4, 0);
+        if (action < 0 || action == 3) return;
+        if (action == 0) {
+            showTextBlock("DEVICE KEY", "Add to ~/.ssh/authorized_keys", publicKeyLine);
+        } else if (action == 1) {
+            Serial.println(String("ssh-public-key: ") + publicKeyLine);
+            waitMessage("Printed to USB serial", clipped(fingerprint, 38), "", kSuccess);
+        } else if (action == 2 && confirm("Replace device key?", "Servers must add it again", "Replace")) {
+            generateDeviceKey();
+        }
+    }
+}
+
+void AppController::loadVpnConfig() {
+    size_t length = 0;
+    VpnConfigData stored{};
+    if (configStorage_.length(kVpnStorageKey, length) == BlobStatus::Ok && length == sizeof(stored) &&
+        configStorage_.read(kVpnStorageKey, &stored, sizeof(stored)) && validateVpnConfig(stored)) {
+        vpn_ = stored;
+    } else {
+        resetVpnConfig(vpn_);
+    }
+    secureClear(&stored, sizeof(stored));
+}
+
+bool AppController::saveVpnConfig(const VpnConfigData& vpn) {
+    if (!validateVpnConfig(vpn)) return false;
+    VpnConfigData readBack{};
+    const bool saved = configStorage_.write(kVpnStorageKey, &vpn, sizeof(vpn)) &&
+                       configStorage_.read(kVpnStorageKey, &readBack, sizeof(readBack)) &&
+                       memcmp(&readBack, &vpn, sizeof(vpn)) == 0;
+    secureClear(&readBack, sizeof(readBack));
+    if (saved) vpn_ = vpn;
+    return saved;
+}
+
+bool AppController::ensureVpnKey() {
+    if (isWireGuardKey(vpn_.privateKey)) return true;
+    VpnConfigData updated = vpn_;
+    const bool generated = WireGuardTunnel::generatePrivateKey(updated.privateKey);
+    if (generated) finalizeVpnConfig(updated);
+    const bool saved = generated && saveVpnConfig(updated);
+    secureClear(&updated, sizeof(updated));
+    if (!saved) waitMessage("VPN key failed", "Cannot create or save key", "", kError);
+    return saved;
+}
+
+void AppController::ensureVpn() {
+    if (vpn_.enabled == 0 || vpnAttempted_ || tunnel_.running() || WiFi.status() != WL_CONNECTED) return;
+    vpnAttempted_ = true;
+    vpnError_ = "";
+    if (!vpnConfigReady(vpn_)) {
+        vpnError_ = "Config incomplete";
+        return;
+    }
+    operationDetail_ = "Needed for the WireGuard handshake";
+    if (!syncClock(kClockSyncTimeoutMs, operationCallbacks())) {
+        vpnError_ = "Clock sync failed";
+        waitMessage("VPN not started", "Cannot set the clock (NTP)", "Hosts outside the VPN still work", kWarning);
+        return;
+    }
+    ui_.progress("Starting VPN", vpn_.endpointHost, 0, 0, true);
+    if (!tunnel_.start(vpn_, vpnError_)) {
+        waitMessage("VPN not started", clipped(vpnError_, 38), "Hosts outside the VPN still work", kWarning);
+    }
+}
+
+String AppController::vpnStatusText() {
+    if (vpn_.enabled == 0) return "Off";
+    if (tunnel_.running()) return tunnel_.peerUp() ? "Connected" : "Waiting for handshake";
+    if (!vpnConfigReady(vpn_)) return "Not configured";
+    return vpnError_.isEmpty() ? String("Not started") : vpnError_;
+}
+
+void AppController::vpnMenu() {
+    if (!ensureVpnKey()) return;
+    while (true) {
+        char publicKey[kWireGuardKeyCapacity]{};
+        WireGuardTunnel::publicKeyFor(vpn_.privateKey, publicKey);
+        char address[16]{};
+        formatIpv4(vpn_.address, address, sizeof(address));
+        const String endpoint = vpnConfigReady(vpn_)
+                                    ? String(vpn_.endpointHost) + ":" + vpn_.endpointPort
+                                    : String("No peer yet: import a config");
+        const String labels[] = {vpn_.enabled ? "VPN: ON" : "VPN: OFF", "Device public key",
+                                 "Print public key to USB", "Import config over USB",
+                                 "Generate new key", "Back"};
+        const String details[] = {vpnStatusText(), "For the server's [Peer]", "", clipped(endpoint, 38),
+                                  "Server must update its peer", ""};
+        const int action = selectMenu("WireGuard VPN", labels, details, 6, 0,
+                                      vpnConfigReady(vpn_) ? String(address) : String(""));
+        if (action < 0 || action == 5) return;
+        if (action == 0) {
+            if (vpn_.enabled == 0 && !vpnConfigReady(vpn_)) {
+                waitMessage("VPN not configured", "Import a wg-quick config", "over USB first", kWarning);
+                continue;
+            }
+            VpnConfigData updated = vpn_;
+            updated.enabled = vpn_.enabled ? 0 : 1;
+            finalizeVpnConfig(updated);
+            if (!saveVpnConfig(updated)) waitMessage("Save failed", "VPN setting kept", "", kError);
+            secureClear(&updated, sizeof(updated));
+            tunnel_.stop();
+            vpnAttempted_ = false;
+            ensureVpn();
+        } else if (action == 1) {
+            showTextBlock("VPN KEY", "WireGuard public key", publicKey);
+        } else if (action == 2) {
+            Serial.println(String("wireguard-public-key: ") + publicKey);
+            waitMessage("Printed to USB serial", publicKey, "", kSuccess);
+        } else if (action == 3) {
+            importVpnOverUsb();
+        } else if (action == 4 && confirm("Replace VPN key?", "Server must update its peer", "Replace")) {
+            tunnel_.stop();
+            VpnConfigData updated = vpn_;
+            secureClear(updated.privateKey, sizeof(updated.privateKey));
+            finalizeVpnConfig(updated);
+            if (saveVpnConfig(updated)) ensureVpnKey();
+            secureClear(&updated, sizeof(updated));
+            vpnAttempted_ = false;
+        }
+    }
+}
+
+void AppController::importVpnOverUsb() {
+    ui_.textBlock("VPN IMPORT", "Waiting for a wg-quick config on USB",
+                  "Send the [Interface] and [Peer] lines, then a line with only END. A PrivateKey "
+                  "line is optional: without one the device keeps its own key.",
+                  "Fn+` Cancel", kAccent);
+    transitionInputContext(InputContext::Dialog);
+    while (Serial.available() > 0) Serial.read();
+
+    serialImportActive_ = true;
+    String text;
+    String line;
+    bool finished = false;
+    const char* failure = nullptr;
+    const uint32_t startedAt = millis();
+    while (!finished && failure == nullptr) {
+        KeyEvent eventValue;
+        if (pollEvent(InputContext::Dialog, eventValue) && eventValue.type == KeyEventType::Back) {
+            failure = "Canceled";
+            break;
+        }
+        while (Serial.available() > 0 && !finished && failure == nullptr) {
+            const char value = static_cast<char>(Serial.read());
+            if (value == '\r') continue;
+            if (value != '\n') {
+                if (line.length() >= kVpnImportLineLimit) failure = "Line too long";
+                else line += value;
+                continue;
+            }
+            line.trim();
+            if (line == "END") {
+                finished = true;
+            } else if (text.length() + line.length() + 1 > kMaxWgQuickConfigLength) {
+                failure = "Config too long";
+            } else {
+                text += line;
+                text += '\n';
+            }
+            clearSensitiveString(line);
+        }
+        if (millis() - startedAt >= kVpnImportTimeoutMs) failure = "Timed out";
+        delay(5);
+    }
+    clearSensitiveString(line);
+    serialImportActive_ = false;
+
+    if (failure != nullptr) {
+        clearSensitiveString(text);
+        Serial.println(String("vpn-import: error: ") + failure);
+        if (strcmp(failure, "Canceled") != 0) waitMessage("Import failed", failure, "Nothing saved", kError);
+        return;
+    }
+
+    VpnConfigData updated = vpn_;
+    const WgQuickParseStatus status = parseWgQuickConfig(text.c_str(), updated);
+    clearSensitiveString(text);
+    if (status != WgQuickParseStatus::Ok) {
+        secureClear(&updated, sizeof(updated));
+        Serial.println(String("vpn-import: error: ") + wgQuickParseStatusText(status));
+        waitMessage("Import failed", wgQuickParseStatusText(status), "Nothing saved", kError);
+        return;
+    }
+    updated.enabled = 1;
+    finalizeVpnConfig(updated);
+    const bool saved = saveVpnConfig(updated);
+    secureClear(&updated, sizeof(updated));
+    if (!saved) {
+        Serial.println("vpn-import: error: save failed");
+        waitMessage("Import failed", "Cannot save config", "Nothing saved", kError);
+        return;
+    }
+    Serial.println("vpn-import: ok");
+    tunnel_.stop();
+    vpnAttempted_ = false;
+    waitMessage("VPN config imported", clipped(String(vpn_.endpointHost) + ":" + vpn_.endpointPort, 38),
+                "VPN is on", kSuccess);
+    ensureVpn();
+}
+
+void AppController::serviceSerialCommands() {
+    if (serialImportActive_) return;
+    while (Serial.available() > 0) {
+        const char value = static_cast<char>(Serial.read());
+        if (value == '\r') continue;
+        if (value != '\n') {
+            if (serialLine_.length() < 32) serialLine_ += value;
+            continue;
+        }
+        serialLine_.trim();
+        if (serialLine_ == "keys") printPublicKeys();
+        serialLine_ = "";
+    }
+}
+
+void AppController::printPublicKeys() {
+    String publicKeyLine;
+    String fingerprint;
+    if (identityHasSshKey(identity_) &&
+        SshClient::describePublicKey(identity_.sshPrivateKey, deviceKeyComment().c_str(), publicKeyLine, fingerprint)) {
+        Serial.println(String("ssh-public-key: ") + publicKeyLine);
+    }
+    char publicKey[kWireGuardKeyCapacity]{};
+    if (WireGuardTunnel::publicKeyFor(vpn_.privateKey, publicKey)) {
+        Serial.println(String("wireguard-public-key: ") + publicKey);
+    }
+}
+
+void AppController::showTextBlock(const String& title, const String& header, const String& value) {
+    ui_.textBlock(title, header, value, "Enter: back", kAccent);
+    transitionInputContext(InputContext::Dialog);
+    while (true) {
+        const KeyEvent eventValue = waitEvent(InputContext::Dialog);
+        if (eventValue.type == KeyEventType::Confirm || eventValue.type == KeyEventType::Back) return;
+    }
 }
 
 String AppController::formatFingerprint(const uint8_t* hash, size_t length) {

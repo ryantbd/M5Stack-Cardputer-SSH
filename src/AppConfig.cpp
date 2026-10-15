@@ -389,4 +389,8 @@ void secureClear(void* data, size_t length) {
     }
 }
 
+uint32_t calculateCrc32(const void* data, size_t length) {
+    return crc32(static_cast<const uint8_t*>(data), length);
+}
+
 }  // namespace app

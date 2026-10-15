@@ -49,6 +49,12 @@ public:
                 const String& footer,
                 uint16_t accentColor);
     void fingerprint(const String& title, const String& value, const String& footer, uint16_t accentColor);
+    // Shows a long value (such as a public key) wrapped across up to 8 lines.
+    void textBlock(const String& title,
+                   const String& header,
+                   const String& value,
+                   const String& footer,
+                   uint16_t accentColor);
     void invalidateTerminal();
     void terminal(const UiStatus& status,
                   const TerminalEmulator& terminal,

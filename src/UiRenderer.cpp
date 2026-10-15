@@ -510,6 +510,29 @@ void UiRenderer::fingerprint(const String& title,
     canvas_.pushSprite(0, 0);
 }
 
+void UiRenderer::textBlock(const String& title,
+                           const String& header,
+                           const String& value,
+                           const String& footer,
+                           uint16_t accentColor) {
+    constexpr size_t kColumns = 39;
+    constexpr size_t kMaxLines = 8;
+    frame("CARDPUTER SSH", title, accentColor);
+    canvas_.setTextDatum(top_left);
+    canvas_.setTextColor(accentColor, kBackground);
+    canvas_.drawString(clipped(header, kColumns), 3, 20);
+    canvas_.setTextColor(kForeground, kBackground);
+    for (size_t line = 0; line < kMaxLines && line * kColumns < value.length(); ++line) {
+        const size_t end = min(value.length(), (line + 1) * kColumns);
+        canvas_.drawString(value.substring(line * kColumns, end), 3, 34 + static_cast<int>(line) * 10);
+    }
+    canvas_.fillRect(0, 119, canvas_.width(), 16, kPanel);
+    canvas_.setTextDatum(middle_center);
+    canvas_.setTextColor(kMuted, kPanel);
+    canvas_.drawString(clipped(footer, 38), canvas_.width() / 2, 127);
+    canvas_.pushSprite(0, 0);
+}
+
 void UiRenderer::invalidateTerminal() { terminalFrameValid_ = false; }
 
 void UiRenderer::terminal(const UiStatus& status,
