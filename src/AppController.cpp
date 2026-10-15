@@ -41,6 +41,50 @@ void clearSensitiveString(String& value) {
     value = "";
 }
 
+// Calls field(key, value) for each "key=value" line of a serial command body.
+// Keys are trimmed and lower-cased; values are passed as sent (a Wi-Fi
+// password may have spaces) and wiped afterwards. Returns false on a line
+// without '=' or when field() rejects a value.
+template <typename Field>
+bool forEachSerialField(const String& text, Field field) {
+    int start = 0;
+    bool valid = true;
+    while (valid && start < static_cast<int>(text.length())) {
+        int end = text.indexOf('\n', start);
+        if (end < 0) end = static_cast<int>(text.length());
+        String line = text.substring(start, end);
+        start = end + 1;
+        if (line.isEmpty()) continue;
+        const int equals = line.indexOf('=');
+        if (equals <= 0) {
+            valid = false;
+        } else {
+            String key = line.substring(0, equals);
+            key.trim();
+            key.toLowerCase();
+            String value = line.substring(equals + 1);
+            valid = field(key, value);
+            clearSensitiveString(value);
+        }
+        clearSensitiveString(line);
+    }
+    return valid;
+}
+
+// "SHA256:<base64>" as printed by ssh-keygen -l (OpenSSH omits the padding).
+bool decodeHostKeyFingerprint(const String& text, uint8_t (&digest)[kHostKeyHashSize]) {
+    String encoded = text.startsWith("SHA256:") ? text.substring(7) : text;
+    while (encoded.length() % 4 != 0) encoded += '=';
+    uint8_t decoded[kHostKeyHashSize + 4]{};
+    size_t length = 0;
+    const bool ok = mbedtls_base64_decode(decoded, sizeof(decoded), &length,
+                                          reinterpret_cast<const unsigned char*>(encoded.c_str()),
+                                          encoded.length()) == 0 &&
+                    length == kHostKeyHashSize;
+    if (ok) memcpy(digest, decoded, kHostKeyHashSize);
+    return ok;
+}
+
 String priorityLabel(uint8_t priority) {
     if (priority == static_cast<uint8_t>(WifiPriority::High)) return "High";
     if (priority == static_cast<uint8_t>(WifiPriority::Low)) return "Low";
@@ -1416,45 +1460,206 @@ void AppController::importVpnOverUsb() {
         return;
     }
 
-    VpnConfigData updated = vpn_;
-    const WgQuickParseStatus status = parseWgQuickConfig(text.c_str(), updated);
+    String error;
+    const bool applied = applyVpnImport(text.c_str(), error);
     clearSensitiveString(text);
-    if (status != WgQuickParseStatus::Ok) {
-        secureClear(&updated, sizeof(updated));
-        Serial.println(String("vpn-import: error: ") + wgQuickParseStatusText(status));
-        waitMessage("Import failed", wgQuickParseStatusText(status), "Nothing saved", kError);
-        return;
-    }
-    updated.enabled = 1;
-    finalizeVpnConfig(updated);
-    const bool saved = saveVpnConfig(updated);
-    secureClear(&updated, sizeof(updated));
-    if (!saved) {
-        Serial.println("vpn-import: error: save failed");
-        waitMessage("Import failed", "Cannot save config", "Nothing saved", kError);
+    if (!applied) {
+        Serial.println(String("vpn-import: error: ") + error);
+        waitMessage("Import failed", error, "Nothing saved", kError);
         return;
     }
     Serial.println("vpn-import: ok");
-    tunnel_.stop();
-    vpnAttempted_ = false;
     waitMessage("VPN config imported", clipped(String(vpn_.endpointHost) + ":" + vpn_.endpointPort, 38),
                 "VPN is on", kSuccess);
     ensureVpn();
 }
 
+// USB serial commands, one per line:
+//   keys        print the device's SSH and WireGuard public keys
+//   wifi-add    then ssid=, password=, optional hidden=1, then END
+//   host-add    then name=, host=, port=, user=, optional hostkey=SHA256:..., then END
+//   vpn-import  then a wg-quick config, then END
+// Each command replies "<command>: ok" or "<command>: error: <reason>". After a
+// change the device restarts to apply it, unless an SSH session is open.
 void AppController::serviceSerialCommands() {
     if (serialImportActive_) return;
     while (Serial.available() > 0) {
         const char value = static_cast<char>(Serial.read());
         if (value == '\r') continue;
         if (value != '\n') {
-            if (serialLine_.length() < 32) serialLine_ += value;
+            if (serialLine_.length() < kVpnImportLineLimit) serialLine_ += value;
+            else serialOverflow_ = true;
             continue;
         }
-        serialLine_.trim();
-        if (serialLine_ == "keys") printPublicKeys();
-        serialLine_ = "";
+        handleSerialLine();
     }
+}
+
+void AppController::handleSerialLine() {
+    String line = serialLine_;
+    clearSensitiveString(serialLine_);
+    const bool overflow = serialOverflow_;
+    serialOverflow_ = false;
+
+    if (serialMode_ == SerialMode::Command) {
+        line.trim();
+        if (line == "keys") printPublicKeys();
+        else if (line == "wifi-add") serialMode_ = SerialMode::WifiAdd;
+        else if (line == "host-add") serialMode_ = SerialMode::HostAdd;
+        else if (line == "vpn-import") serialMode_ = SerialMode::VpnImport;
+        else if (!line.isEmpty()) Serial.println("error: commands are keys, wifi-add, host-add, vpn-import");
+        clearSensitiveString(line);
+        return;
+    }
+    if (line == "END") {
+        finishSerialPayload();
+        return;
+    }
+    if (overflow || serialPayload_.length() + line.length() + 1 > kMaxWgQuickConfigLength) {
+        clearSensitiveString(serialPayload_);
+        serialMode_ = SerialMode::Command;
+        Serial.println("error: input too long, command discarded");
+    } else {
+        serialPayload_ += line;
+        serialPayload_ += '\n';
+    }
+    clearSensitiveString(line);
+}
+
+void AppController::finishSerialPayload() {
+    const SerialMode mode = serialMode_;
+    serialMode_ = SerialMode::Command;
+    const char* command = mode == SerialMode::WifiAdd   ? "wifi-add"
+                          : mode == SerialMode::HostAdd ? "host-add"
+                                                        : "vpn-import";
+    String error;
+    bool applied = false;
+    if (mode == SerialMode::WifiAdd) applied = applyWifiFromSerial(serialPayload_, error);
+    else if (mode == SerialMode::HostAdd) applied = applyHostFromSerial(serialPayload_, error);
+    else applied = applyVpnImport(serialPayload_.c_str(), error);
+    clearSensitiveString(serialPayload_);
+
+    if (!applied) {
+        Serial.println(String(command) + ": error: " + error);
+        return;
+    }
+    if (flow_.sessionLive()) {
+        Serial.println(String(command) + ": ok, applies after restart");
+        return;
+    }
+    // Restarting is the simplest way to leave whatever screen is showing and
+    // pick the change up in the normal boot flow.
+    Serial.println(String(command) + ": ok, restarting");
+    Serial.flush();
+    delay(200);
+    ESP.restart();
+}
+
+bool AppController::applyWifiFromSerial(const String& text, String& error) {
+    WifiProfile profile{};
+    profile.priority = static_cast<uint8_t>(WifiPriority::Normal);
+    profile.enabled = 1;
+    bool fieldsValid = forEachSerialField(text, [&](const String& key, String& value) {
+        if (key == "ssid") return copyConfigString(profile.ssid, sizeof(profile.ssid), value.c_str());
+        if (key == "password") return copyConfigString(profile.password, sizeof(profile.password), value.c_str());
+        if (key == "hidden") {
+            profile.hidden = value == "1" ? 1 : 0;
+            return value == "0" || value == "1";
+        }
+        return false;
+    });
+    if (!fieldsValid || profile.ssid[0] == '\0') {
+        secureClear(&profile, sizeof(profile));
+        error = "need ssid= and password= lines (values too long?)";
+        return false;
+    }
+
+    // Replace a profile with the same SSID (e.g. a new password), else add.
+    ProfileConfigData updated = config_;
+    int existing = -1;
+    for (uint8_t index = 0; index < config_.wifiCount; ++index) {
+        if (strcmp(config_.wifi[index].ssid, profile.ssid) == 0) existing = index;
+    }
+    const bool changed = existing >= 0 ? replaceWifiProfile(updated, static_cast<size_t>(existing), profile)
+                                       : addWifiProfile(updated, profile);
+    secureClear(&profile, sizeof(profile));
+    if (!changed || !profileStore_.save(updated)) {
+        secureClear(&updated, sizeof(updated));
+        error = config_.wifiCount >= kMaxWifiProfiles && existing < 0 ? "Wi-Fi list full (4)" : "invalid or not saved";
+        return false;
+    }
+    config_ = updated;
+    secureClear(&updated, sizeof(updated));
+    ++configGeneration_;
+    return true;
+}
+
+bool AppController::applyHostFromSerial(const String& text, String& error) {
+    SshHostProfile host{};
+    host.port = kDefaultSshPort;
+    host.enabled = 1;
+    bool keyValid = true;
+    bool fieldsValid = forEachSerialField(text, [&](const String& key, String& value) {
+        value.trim();
+        if (key == "name") return copyConfigString(host.displayName, sizeof(host.displayName), value.c_str());
+        if (key == "host") return copyConfigString(host.host, sizeof(host.host), value.c_str());
+        if (key == "user") return copyConfigString(host.user, sizeof(host.user), value.c_str());
+        if (key == "port") {
+            const long port = value.toInt();
+            host.port = static_cast<uint16_t>(port);
+            return port >= 1 && port <= 65535;
+        }
+        if (key == "hostkey") {
+            keyValid = decodeHostKeyFingerprint(value, host.hostKeySha256);
+            host.hostKeyTrusted = keyValid ? 1 : 0;
+            return keyValid;
+        }
+        return false;
+    });
+    if (host.displayName[0] == '\0') copyConfigString(host.displayName, sizeof(host.displayName), host.host);
+    if (!fieldsValid || host.host[0] == '\0' || host.user[0] == '\0') {
+        error = keyValid ? "need host= and user= lines" : "hostkey must be SHA256:<base64> from ssh-keygen -l";
+        return false;
+    }
+
+    // Replace the profile with the same display name, else add a new one.
+    ProfileConfigData updated = config_;
+    int existing = -1;
+    for (uint8_t index = 0; index < config_.hostCount; ++index) {
+        if (strcmp(config_.hosts[index].displayName, host.displayName) == 0) existing = index;
+    }
+    const bool changed = existing >= 0 ? HostCatalog::replaceVerified(updated, static_cast<size_t>(existing), host)
+                                       : HostCatalog::add(updated, host);
+    if (!changed || !profileStore_.save(updated)) {
+        secureClear(&updated, sizeof(updated));
+        error = config_.hostCount >= kMaxSshHostProfiles && existing < 0 ? "host list full (8)" : "invalid or not saved";
+        return false;
+    }
+    config_ = updated;
+    secureClear(&updated, sizeof(updated));
+    ++configGeneration_;
+    return true;
+}
+
+bool AppController::applyVpnImport(const char* text, String& error) {
+    VpnConfigData updated = vpn_;
+    const WgQuickParseStatus status = parseWgQuickConfig(text, updated);
+    if (status != WgQuickParseStatus::Ok) {
+        secureClear(&updated, sizeof(updated));
+        error = wgQuickParseStatusText(status);
+        return false;
+    }
+    updated.enabled = 1;
+    finalizeVpnConfig(updated);
+    const bool saved = saveVpnConfig(updated);
+    secureClear(&updated, sizeof(updated));
+    if (!saved) {
+        error = "save failed";
+        return false;
+    }
+    tunnel_.stop();
+    vpnAttempted_ = false;
+    return true;
 }
 
 void AppController::printPublicKeys() {

@@ -36,6 +36,7 @@ private:
     enum class HostEditOutcome : uint8_t { Stay, ReturnToLauncher, Connected };
     enum class DraftAttemptResult : uint8_t { Authenticated, Canceled, HostKeyMismatch, Failed };
     enum class AuthResult : uint8_t { Authenticated, Canceled, Failed };
+    enum class SerialMode : uint8_t { Command, WifiAdd, VpnImport, HostAdd };
 
     static bool operationCanceledThunk(void* context);
     static void operationProgressThunk(const char* stage, uint16_t current, uint16_t total, void* context);
@@ -88,6 +89,11 @@ private:
     void importVpnOverUsb();
     void showTextBlock(const String& title, const String& header, const String& value);
     void serviceSerialCommands();
+    void handleSerialLine();
+    void finishSerialPayload();
+    bool applyWifiFromSerial(const String& text, String& error);
+    bool applyHostFromSerial(const String& text, String& error);
+    bool applyVpnImport(const char* text, String& error);
     void printPublicKeys();
     void settingsMenu();
     void diagnosticsPage();
@@ -120,7 +126,10 @@ private:
     String vpnError_;
     bool vpnAttempted_ = false;
     bool serialImportActive_ = false;
+    bool serialOverflow_ = false;
+    SerialMode serialMode_ = SerialMode::Command;
     String serialLine_;
+    String serialPayload_;
     SessionFlow flow_;
     WifiScanSummary lastScanSummary_{};
 
